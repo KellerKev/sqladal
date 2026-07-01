@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqladal"
+version = "0.7.1"
+description = "A pydal-API-compatible data abstraction layer backed by SQLAlchemy Core (sync + async)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "KellerKev", email = "kellerkev@gmail.com" }]
+keywords = ["pydal", "sqlalchemy", "orm", "dal", "async", "web2py", "websaw"]
+dependencies = [
+    "SQLAlchemy>=2.0",
+]
+
+[project.optional-dependencies]
+async = ["greenlet>=3.0"]            # required by SQLAlchemy async
+sqlite-async = ["aiosqlite>=0.19"]
+postgres = ["psycopg[binary]>=3.1"]
+postgres-async = ["asyncpg>=0.29"]
+mysql = ["PyMySQL>=1.1"]
+mysql-async = ["aiomysql>=0.2"]
+migrations = ["alembic>=1.13"]
+# OpenAPI/Swagger: the generator is pure-Python and the UIs load from a CDN, so
+# nothing is required at runtime; this extra only covers the test validator.
+openapi = ["openapi-spec-validator>=0.7"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "aiosqlite>=0.19", "alembic>=1.13",
+       "openapi-spec-validator>=0.7"]
+
+[project.urls]
+Homepage = "https://github.com/KellerKev/sqladal"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqladal"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+# ---------------------------------------------------------------------------
+# pixi dev environment (conda-forge). `pixi run test`
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.13.*"
+"sqlalchemy" = ">=2.0"
+greenlet = ">=3.0"
+aiosqlite = ">=0.19"
+alembic = ">=1.13"
+pytest = ">=8"
+pytest-asyncio = ">=0.23"
+pip = "*"
+uvicorn = ">=0.29"        # examples serve under the ombott fork's ASGI server
+websockets = ">=12"
+
+[tool.pixi.pypi-dependencies]
+sqladal = { path = ".", editable = true }
+ombott-ng = { path = "../ombott", editable = true }   # the maintained fork (ASGI/uvicorn/ws)
+
+[tool.pixi.tasks]
+test = "pytest -q"
+

@@ -1,0 +1,30 @@
+# pixi
+.pixi/
+*.lock
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# local db files / scratch
+*.sqlite
+*.db
+storage.db
+.devdeps/
+examples/api_demo/*.db
+examples/secure_api/*.db
+examples/websaw_api/apps/site/databases/*.db
+*.pyc
+.mypy_cache/
+*.db-journal
+*.duckdb
+.DS_Store
+.service/
+session.secret
+websaw.log
+node_modules/
