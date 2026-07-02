@@ -640,6 +640,10 @@ class IS_IN_DB(Validator):
         table = None
         if isinstance(field, Table):
             table = field
+            if table._id is None:
+                raise RuntimeError(
+                    "IS_IN_DB requires a single-key table or an explicit field; "
+                    "table %r has a composite/no primary key" % table._tablename)
             field = table._id
             fname = str(field)
         if isinstance(field, Field):
@@ -846,6 +850,11 @@ class IS_NOT_IN_DB(Validator):
         ignore_common_filters=False,
     ):
         if isinstance(field, Table):
+            if field._id is None:
+                raise RuntimeError(
+                    "IS_NOT_IN_DB requires a single-key table or an explicit "
+                    "field; table %r has a composite/no primary key"
+                    % field._tablename)
             field = field._id
         self.dbset = dbset
         self.field = field

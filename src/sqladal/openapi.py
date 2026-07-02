@@ -181,10 +181,28 @@ def _err_resps():
     return {"400": err, "401": err, "404": err}
 
 
-def _table_paths(base, tname, read_ref, write_ref, allowed) -> dict:
+def _table_paths(base, tname, read_ref, write_ref, allowed, pk_names=("id",)) -> dict:
     paths: Dict[str, dict] = {}
-    p_list, p_item = "%s/%s" % (base, tname), "%s/%s/{id}" % (base, tname)
-    id_param = {"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}}
+    pk_names = tuple(pk_names)
+    composite = len(pk_names) > 1
+    has_item = bool(pk_names)                              # no-PK table -> list/create only
+    p_list = "%s/%s" % (base, tname)
+    if composite:
+        p_item = "%s/%s/{key}" % (base, tname)
+        id_param = {"name": "key", "in": "path", "required": True,
+                    "schema": {"type": "string"},
+                    "description": "composite key token (fields: %s, in order)"
+                                   % ", ".join(pk_names)}
+        id_schema = {"type": "object"}
+    elif has_item:
+        single = pk_names[0]
+        ptype = "integer" if single == "id" else "string"
+        p_item = "%s/%s/{id}" % (base, tname)
+        id_param = {"name": "id", "in": "path", "required": True, "schema": {"type": ptype}}
+        id_schema = {"type": ptype}
+    else:
+        p_item = None
+        id_schema = {"type": "null"}
     tag = tname
     if allowed["GET"]:
         params = [{"name": n, "in": "query", "schema": {"type": t}, "description": d}
@@ -195,22 +213,23 @@ def _table_paths(base, tname, read_ref, write_ref, allowed) -> dict:
             "responses": {"200": _json_resp("Matching rows", _envelope_with_items(read_ref)),
                           **_err_resps()},
         }
-        paths.setdefault(p_item, {})["get"] = {
-            "tags": [tag], "summary": "Get one %s" % tname, "operationId": "get_%s" % tname,
-            "parameters": [id_param],
-            "responses": {"200": _json_resp("The row", _envelope_with_items(read_ref)),
-                          **_err_resps()},
-        }
+        if has_item:
+            paths.setdefault(p_item, {})["get"] = {
+                "tags": [tag], "summary": "Get one %s" % tname, "operationId": "get_%s" % tname,
+                "parameters": [id_param],
+                "responses": {"200": _json_resp("The row", _envelope_with_items(read_ref)),
+                              **_err_resps()},
+            }
     if allowed["POST"]:
         paths.setdefault(p_list, {})["post"] = {
             "tags": [tag], "summary": "Create a %s" % tname, "operationId": "create_%s" % tname,
             "requestBody": {"required": True, "content": {"application/json": {"schema": write_ref}}},
             "responses": {"200": _json_resp(
                 "Insert result",
-                {"type": "object", "properties": {"id": {"type": "integer"},
+                {"type": "object", "properties": {"id": id_schema,
                  "errors": {"type": "object"}, "success": {"type": "boolean"}}}), **_err_resps()},
         }
-    if allowed["PUT"]:
+    if allowed["PUT"] and has_item:
         paths.setdefault(p_item, {})["put"] = {
             "tags": [tag], "summary": "Update a %s" % tname, "operationId": "update_%s" % tname,
             "parameters": [id_param],
@@ -220,7 +239,7 @@ def _table_paths(base, tname, read_ref, write_ref, allowed) -> dict:
                 {"type": "object", "properties": {"updated": {"type": "integer"},
                  "errors": {"type": "object"}, "success": {"type": "boolean"}}}), **_err_resps()},
         }
-    if allowed["DELETE"]:
+    if allowed["DELETE"] and has_item:
         paths.setdefault(p_item, {})["delete"] = {
             "tags": [tag], "summary": "Delete a %s" % tname, "operationId": "delete_%s" % tname,
             "parameters": [id_param],
@@ -275,7 +294,9 @@ def build_spec(db, *, policy=ALLOW_ALL_POLICY, base: str = "/api",
                                                if tann and tann.get("description") else {})})
         read_ref = {"$ref": "#/components/schemas/%s" % read_name}
         write_ref = {"$ref": "#/components/schemas/%s" % write_name}
-        for path, ops in _table_paths(base, tname, read_ref, write_ref, allowed).items():
+        pk_names = [f.name for f in table._pk_fields]
+        for path, ops in _table_paths(base, tname, read_ref, write_ref, allowed,
+                                      pk_names).items():
             spec["paths"].setdefault(path, {}).update(ops)
     if app is not None:
         _merge_custom_paths(spec, app, skip_prefix=base)
@@ -650,10 +671,11 @@ def serve_api(app, db, *, policy=ALLOW_ALL_POLICY, base: str = "/api",
         return ombott_ng.HTTPResponse(payload, status=code, headers=headers)
 
     def _pk_name(table):
-        try:
-            return db[table]._id.name
-        except Exception:
-            return "id"
+        t = db[table]
+        return t._pk_fields[0].name if len(t._pk_fields) == 1 else "id"
+
+    def _single_key(table):
+        return len(db[table]._pk_fields) == 1
 
     def _handle(table, ident):
         req = ombott_ng.request
@@ -666,7 +688,7 @@ def serve_api(app, db, *, policy=ALLOW_ALL_POLICY, base: str = "/api",
         if err:
             return _error(*err)
         get_vars, post_vars = _read_vars(req, method)
-        if cursor and method == "GET" and ident is None:
+        if cursor and method == "GET" and ident is None and _single_key(table):
             cur = get_vars.pop("@after", None) or get_vars.pop("@cursor", None)
             if cur is not None:
                 pk = _pk_name(table)
@@ -676,7 +698,8 @@ def serve_api(app, db, *, policy=ALLOW_ALL_POLICY, base: str = "/api",
         code = result.get("code", 200) if isinstance(result, dict) else 200
         if code >= 400:
             return _error(code, result.get("message") if isinstance(result, dict) else "error")
-        if cursor and method == "GET" and ident is None and isinstance(result, dict):
+        if (cursor and method == "GET" and ident is None and _single_key(table)
+                and isinstance(result, dict)):
             items = result.get("items")
             if items:
                 result["next_cursor"] = items[-1].get(_pk_name(table))

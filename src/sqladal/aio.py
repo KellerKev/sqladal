@@ -115,7 +115,7 @@ class AsyncDAL(DAL):
 
     async def fetch(self, table: Table, key):
         """Explicit single-row fetch (async replacement for ``table(id)``)."""
-        rows = await self(table._id == key).select()
+        rows = await self(table._pk_query(key)).select()
         return rows.first()
 
     # ---- read --------------------------------------------------------------
@@ -143,7 +143,7 @@ class AsyncDAL(DAL):
         stmt = sa.insert(table._sa_table).values(**self._filter_columns(table, values))
         conn = await self._connection_async()
         result = await conn.execute(stmt)
-        new_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
+        new_id = self._pk_return(table, values, result.inserted_primary_key)
         for hook in table._after_insert:
             hook(values, new_id)
         return new_id

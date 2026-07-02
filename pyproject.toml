@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqladal"
-version = "0.7.1"
+version = "0.8.0"
 description = "A pydal-API-compatible data abstraction layer backed by SQLAlchemy Core (sync + async)."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import json
 import os
 import re
 import shutil
@@ -130,8 +131,7 @@ class Row(Storage):
         if not meta:
             raise RuntimeError("update_record requires a db-bound row")
         table, db = meta["table"], meta["db"]
-        pk = self[table._id.name]
-        db(table._id == pk).update(**fields)
+        db(table._pk_query(self)).update(**fields)
         self.update(fields)
         return self
 
@@ -140,8 +140,7 @@ class Row(Storage):
         if not meta:
             raise RuntimeError("delete_record requires a db-bound row")
         table, db = meta["table"], meta["db"]
-        pk = self[table._id.name]
-        return db(table._id == pk).delete()
+        return db(table._pk_query(self)).delete()
 
 
 # ---------------------------------------------------------------------------
@@ -650,12 +649,135 @@ class Table:
         self._after_delete = []
         for f in fields:
             self._add_field(f)
-        self._id = self._fields.get("id") or next(iter(self._fields.values()))
+        # Row identity. ``_pk_fields`` (ordered) is the single source of truth:
+        #   primarykey=None -> [id]          (surrogate, default)
+        #   primarykey=["k"] -> [k]          (single natural key)
+        #   primarykey=["a","b"] -> [a, b]   (composite)
+        #   primarykey=[] -> []              (no primary key)
+        # ``_id`` stays a single Field for the two single-key modes (so every
+        # existing ``_id`` code path is unchanged); it is None for composite/no-PK.
+        self._pk_fields = self._compute_pk_fields()
+        self._id = self._pk_fields[0] if len(self._pk_fields) == 1 else None
 
     def _add_field(self, field):
         self._fields[field.name] = field
         self._field_order.append(field.name)
         setattr_safe(self, field.name, field)
+
+    # ---- primary-key model -------------------------------------------------
+    def _compute_pk_fields(self):
+        pk = self._primarykey
+        if pk is None:                      # default: surrogate ``id``
+            return [self._fields["id"]]
+        if not pk:                          # [] -> explicitly no primary key
+            return []
+        missing = [n for n in pk if n not in self._fields]
+        if missing:
+            raise ValueError(
+                "primarykey field(s) %r not found in table %r"
+                % (missing, self._tablename))
+        return [self._fields[n] for n in pk]
+
+    def _pk_query(self, value):
+        """AND-of-equalities WHERE identifying a row by its primary key.
+
+        ``value`` may be a scalar (single-key), a dict{name: val} or ordered
+        tuple/list (composite or single), or a Row. Raises for no-PK tables.
+        """
+        pk = self._pk_fields
+        if not pk:
+            raise TypeError(
+                "table %r has no primary key; use an explicit query to "
+                "update/delete/fetch a row" % self._tablename)
+        if isinstance(value, Row):
+            value = self._pk_of(value)
+        if isinstance(value, dict):
+            q = None
+            for f in pk:
+                if f.name not in value:
+                    raise KeyError(
+                        "primary-key value missing field %r for table %r"
+                        % (f.name, self._tablename))
+                cond = f == value[f.name]
+                q = cond if q is None else (q & cond)
+            return q
+        if isinstance(value, (tuple, list)):
+            if len(value) != len(pk):
+                raise ValueError(
+                    "expected %d primary-key value(s) for table %r, got %d"
+                    % (len(pk), self._tablename, len(value)))
+            q = None
+            for f, v in zip(pk, value):
+                cond = f == v
+                q = cond if q is None else (q & cond)
+            return q
+        # scalar
+        if len(pk) != 1:
+            raise TypeError(
+                "table %r has a composite primary key; pass a dict or tuple"
+                % self._tablename)
+        return pk[0] == value
+
+    def _pk_of(self, row):
+        """Extract the primary-key value from a fetched row: scalar (single),
+        dict (composite), or None (no PK)."""
+        pk = self._pk_fields
+        if not pk:
+            return None
+        if len(pk) == 1:
+            return row[pk[0].name]
+        return {f.name: row[f.name] for f in pk}
+
+    def _all_rows_query(self):
+        """The 'all rows' predicate for ``db(table)`` (pydal semantics)."""
+        pk = self._pk_fields
+        if pk:
+            return pk[0] != None  # noqa: E711
+        return Query(self._db, sa.true(), {self})
+
+    # ---- URL/HTML-safe key token (used by REST, grids, forms) --------------
+    def _pk_token(self, value):
+        """Encode a primary-key value (scalar | dict | None) as a single
+        URL/HTML-safe token. Single key -> ``str(value)`` (so surrogate-id URLs
+        are unchanged); composite -> ``"k~" + base64url(json[values])``; no PK -> ``""``."""
+        pk = self._pk_fields
+        if not pk or value is None:
+            return ""
+        if len(pk) == 1:
+            if isinstance(value, dict):
+                value = value[pk[0].name]
+            return str(value)
+        ordered = ([value[f.name] for f in pk] if isinstance(value, dict)
+                   else list(value))
+        raw = json.dumps(ordered, separators=(",", ":")).encode("utf8")
+        return "k~" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    def _pk_from_token(self, token):
+        """Decode a token from :meth:`_pk_token` back to a native pk value
+        (scalar for single, dict for composite). Raises for no-PK tables."""
+        pk = self._pk_fields
+        if not pk:
+            raise TypeError("table %r has no primary key" % self._tablename)
+        if len(pk) == 1 and not (isinstance(token, str) and token.startswith("k~")):
+            if isinstance(token, dict):
+                token = token[pk[0].name]
+            f = pk[0]
+            if (f.type in ("id", "integer", "bigint") or _t.is_reference(f.type)):
+                try:
+                    return int(token)
+                except (TypeError, ValueError):
+                    return token
+            return token
+        # composite (or a k~ token)
+        if isinstance(token, dict):
+            return {f.name: token[f.name] for f in pk}
+        if isinstance(token, (list, tuple)):
+            ordered = list(token)
+        else:
+            s = token[2:] if token.startswith("k~") else token
+            raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+            ordered = json.loads(raw)
+        return {f.name: v for f, v in zip(pk, ordered)}
 
     # ---- accessors ---------------------------------------------------------
     @property
@@ -667,7 +789,8 @@ class Table:
         return _StarExpression(self)
 
     def __getitem__(self, key):
-        if isinstance(key, (int,)):  # table[id] -> row
+        # table[id] / table[{"a":1,"b":2}] / table[(1, 2)] -> row;  table["col"] -> Field
+        if isinstance(key, (int, dict, tuple)):
             return self.__call__(key)
         return self._fields[key]
 
@@ -740,7 +863,7 @@ class Table:
         if key is not DEFAULT and not kwargs:
             if isinstance(key, Query):
                 return self._db(key).select().first()
-            return self._db(self._id == key).select().first()
+            return self._db(self._pk_query(key)).select().first()
         if kwargs:
             q = None
             for k, v in kwargs.items():
@@ -766,17 +889,18 @@ class Table:
         ``id``/``updated``/``errors``/``success`` (pydal's shape; used by RestAPI).
         """
         record = self(_key) if not isinstance(_key, dict) else self(**_key)
+        rec_pk = self._pk_of(record) if record else None
         errors, cleaned = {}, {}
         for k, v in fields.items():
             if k in self._fields:
-                v, err = self._fields[k].validate(v, record.id if record else None)
+                v, err = self._fields[k].validate(v, rec_pk)
                 (errors if err else cleaned).__setitem__(k, err or v)
             else:
                 cleaned[k] = v
         updated = 0
         if not errors and record:
-            updated = self._db(self._id == record[self._id.name]).update(**cleaned)
-        return Row(id=record and record.id, updated=updated,
+            updated = self._db(self._pk_query(record)).update(**cleaned)
+        return Row(id=rec_pk, updated=updated,
                    errors=Row(errors), success=updated > 0)
 
     def update_or_insert(self, _key=DEFAULT, **values):
@@ -837,7 +961,7 @@ def setattr_safe(obj, name, value):
 def as_query(query):
     """Coerce a Table/Field into the equivalent all-rows Query (pydal semantics)."""
     if isinstance(query, Table):
-        return query._id != None  # noqa: E711
+        return query._all_rows_query()
     if isinstance(query, Field):
         return query != None  # noqa: E711
     return query

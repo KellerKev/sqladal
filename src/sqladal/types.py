@@ -102,6 +102,46 @@ def reference_target(field_type: str) -> tuple[str, str | None]:
     return spec, None
 
 
+def pydal_type_for(col) -> str:
+    """Best-effort inverse of :func:`sa_type_for`: a reflected SQLAlchemy column
+    -> a pydal type string, so a reflected (legacy) table still exposes the pydal
+    Field API. Foreign keys become ``reference``/``big-reference`` strings."""
+    if col.foreign_keys:
+        fk = next(iter(col.foreign_keys))
+        target = fk.column.table.name
+        tcol = fk.column.name
+        base = "big-reference " if isinstance(col.type, sa.BigInteger) else "reference "
+        return base + target + ("" if tcol == "id" else "." + tcol)
+    t = col.type
+    if isinstance(t, sa.Boolean):
+        return "boolean"
+    if isinstance(t, sa.BigInteger):
+        return "bigint"
+    if isinstance(t, sa.Integer):
+        return "integer"
+    if isinstance(t, sa.Float):
+        return "double"
+    if isinstance(t, sa.Numeric):
+        return "decimal(%d,%d)" % (getattr(t, "precision", None) or 10,
+                                   getattr(t, "scale", None) or 2)
+    if isinstance(t, sa.LargeBinary):
+        return "blob"
+    if isinstance(t, sa.Text):                 # Text before String (Text subclasses String)
+        return "text"
+    if isinstance(t, sa.String):
+        n = getattr(t, "length", None)
+        return "string(%d)" % n if n else "string"
+    if isinstance(t, sa.Date):
+        return "date"
+    if isinstance(t, sa.Time):
+        return "time"
+    if isinstance(t, sa.DateTime):
+        return "datetime"
+    if isinstance(t, sa.JSON):
+        return "json"
+    return "text"
+
+
 def sa_type_for(field_type: str, length: int | None = None):
     """Return a SQLAlchemy type instance for a pydal scalar ``field_type``.
 

@@ -80,6 +80,52 @@ This registers `pydal`, `pydal.objects`, `pydal.validators` in `sys.modules`
 pointing at sqladal — so voodoodal's class-based models and websaw's Fixture
 `DAL` (including its per-request `take_on`/`take_off` lifecycle) run unchanged.
 
+## Flexible primary keys
+
+pydal always expects (and, if absent, auto-creates) a single auto-increment `id`.
+sqladal keeps that as the default but no longer *requires* it — so you can model
+**legacy databases**, **warehouse tables with no key**, **composite keys**, and
+**natural keys** cleanly. The default surrogate-`id` path is unchanged.
+
+```python
+db.define_table("post", Field("title"))                       # default: auto id
+db.define_table("country", Field("code"), Field("name"),
+                primarykey=["code"])                          # single natural key
+db.define_table("membership", Field("user", "integer"),
+                Field("role", "integer"), Field("note"),
+                primarykey=["user", "role"])                  # composite key
+db.define_table("events", Field("ts"), Field("kind"),
+                primarykey=[])                                # no primary key
+```
+
+`insert()` returns what the key *is* — a scalar for a single key, a `dict` for a
+composite key, `None` for a no-PK table:
+
+```python
+db.membership.insert(user=1, role=2, note="owner")   # -> {"user": 1, "role": 2}
+db.membership[{"user": 1, "role": 2}]                # fetch by key (dict or tuple)
+db.membership[(1, 2)].update_record(note="admin")    # row ops build the full key
+```
+
+- **Composite keys** work through select/insert/update/delete, references, and the
+  REST/OpenAPI layer; a foreign-key column can itself be part of a composite key.
+- **References** to a natural-key table target the real key column and type (no
+  longer forced to an integer `id`).
+- **No-PK tables** support querying, aggregates, and explicit-`WHERE`
+  `update`/`delete`; row-level `update_record`/`delete_record`/`table(key)` raise
+  a clear error (there's no addressable row).
+- **Legacy reflection**: adopt an existing table and discover its real key (or
+  absence of one) from the database:
+
+  ```python
+  db = DAL("postgres://…")
+  legacy = db.reflect_table("orders")          # columns + primary key from the DB
+  ```
+
+The building blocks are on every `Table`: `_pk_fields` (ordered key columns),
+`_pk_query(value)`, `_pk_of(row)`, and a URL/HTML-safe `_pk_token`/`_pk_from_token`
+(what the REST routes and grids use to carry a composite key in a single segment).
+
 ## What's implemented
 
 - **Schema**: `define_table` → SQLAlchemy `MetaData`/`Table`/`Column`; the pydal
@@ -161,10 +207,11 @@ pointing at sqladal — so voodoodal's class-based models and websaw's Fixture
 
 ## Status
 
-**v0.2.0** — 77 tests passing (`pixi run test`), including the full websaw
-runtime (Fixture DAL + per-request lifecycle + a real HTTP request through
-ombott), voodoodal class-based models, pydal's `RestAPI`, native async on
-aiosqlite, and a 34-check behavioural parity suite.
+**v0.8.0** — 101 tests passing (`pixi run test`), including flexible primary
+keys (composite / natural / no-PK / reflection), the full websaw runtime (Fixture
+DAL + per-request lifecycle + a real HTTP request through ombott), voodoodal
+class-based models, pydal's `RestAPI`, native async on aiosqlite, and a 34-check
+behavioural parity suite.
 
 Not yet covered: GIS/`ST_*`, the legacy `parse_as_rest` patterns, and a handful
 of rarely-used expression helpers — contributions welcome.

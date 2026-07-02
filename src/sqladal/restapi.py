@@ -337,30 +337,49 @@ class RestAPI:
         # apply rules
         if method == "GET":
             if id:
-                get_vars["id.eq"] = id
+                table = self.db[tname]
+                pk = self._pk_from_ident(table, id)
+                for name, val in self._pk_eq_vars(table, pk):
+                    get_vars["%s.eq" % name] = val
             return self.search(tablename, get_vars)
         elif method == "POST":
             table = self.db[tablename]
             return table.validate_and_insert(**post_vars)
 
         elif method == "PUT":
-            id = id or post_vars["id"]
-            if not id:
+            ident = id or post_vars.get("id") or post_vars.get("__pk")
+            if not ident:
                 raise InvalidFormat("No item id specified")
             table = self.db[tablename]
-            data = table.validate_and_update(id, **post_vars)
+            pk = self._pk_from_ident(table, ident)
+            data = table.validate_and_update(pk, **post_vars)
             if not data.get("errors") and not data.get("updated"):
                 raise NotFound("Item not found")
             return data
         elif method == "DELETE":
-            id = id or post_vars["id"]
-            if not id:
+            ident = id or post_vars.get("id") or post_vars.get("__pk")
+            if not ident:
                 raise InvalidFormat("No item id specified")
             table = self.db[tablename]
-            deleted = self.db(table._id == id).delete()
+            pk = self._pk_from_ident(table, ident)
+            deleted = self.db(table._pk_query(pk)).delete()
             if not deleted:
                 raise NotFound("Item not found")
             return {"deleted": deleted}
+
+    def _pk_from_ident(self, table, ident):
+        """Route ident/token -> native pk (scalar for single, dict for composite).
+        Raises for a table with no primary key (no addressable item)."""
+        if not table._pk_fields:
+            raise InvalidFormat("Table %s has no primary key" % table._tablename)
+        return table._pk_from_token(ident)
+
+    @staticmethod
+    def _pk_eq_vars(table, pk):
+        """(fieldname, value) equality filters for a native pk value."""
+        if isinstance(pk, dict):
+            return list(pk.items())
+        return [(table._pk_fields[0].name, pk)]
 
     def table_model(self, table, fieldnames: List[str]) -> List[Dict[str, Any]]:
         """

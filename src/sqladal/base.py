@@ -95,6 +95,11 @@ class DAL:
         if tablename in self._tables and not kwargs.get("redefine"):
             return self._tables[tablename]
 
+        # Legacy / warehouse: adopt an existing DB table, discovering its columns
+        # and real primary key (or lack of one) by reflection instead of DDL.
+        if kwargs.get("reflect"):
+            return self._reflect_table(tablename, **kwargs)
+
         # Only real Field instances become columns; virtuals/methods/signatures
         # are attached afterwards (parity with pydal/voodoodal).
         real_fields, virtuals = [], []
@@ -104,9 +109,18 @@ class DAL:
             else:
                 virtuals.append(f)
 
+        # primarykey: None (default) -> auto surrogate ``id``; a non-empty list
+        # -> explicit natural/composite key; [] -> no primary key at all.
         primarykey = kwargs.get("primarykey")
+        if primarykey is not None:
+            names = {f.name for f in real_fields}
+            missing = [n for n in primarykey if n not in names]
+            if missing:
+                raise ValueError(
+                    "primarykey field(s) %r not found in table %r"
+                    % (missing, tablename))
         has_id = any(f.name == "id" for f in real_fields)
-        if not has_id and not primarykey:
+        if not has_id and primarykey is None:
             id_field = Field("id", "id")
             real_fields.insert(0, id_field)
 
@@ -148,20 +162,72 @@ class DAL:
             on_define(table)
         return table
 
+    def reflect_table(self, tablename, **kwargs):
+        """Adopt an existing database table (columns + real primary key are
+        discovered by reflection). Shorthand for ``define_table(reflect=True)``."""
+        return self.define_table(tablename, reflect=True, **kwargs)
+
+    def _reflect_table(self, tablename, **kwargs):
+        if self._engine is None:
+            raise RuntimeError("cannot reflect %r without a database engine" % tablename)
+        sa_table = sa.Table(tablename, self._metadata,
+                            autoload_with=self._engine, extend_existing=True)
+        fields = [Field(col.name, _t.pydal_type_for(col)) for col in sa_table.columns]
+        # real primary key from the reflected constraint; [] -> no-PK table
+        pk_cols = [c.name for c in sa_table.primary_key.columns]
+        table = Table(self, tablename, sa_table, fields,
+                      format=kwargs.get("format"),
+                      singular=kwargs.get("singular"),
+                      plural=kwargs.get("plural"),
+                      primarykey=pk_cols,
+                      common_filter=kwargs.get("common_filter"),
+                      rname=kwargs.get("rname", tablename))
+        for f in fields:
+            f.bind(table, sa_table.c[f.name])
+        self._tables[tablename] = table
+        self.tables.append(tablename)
+        setattr(self, tablename, table)
+        on_define = kwargs.get("on_define")
+        if on_define:
+            on_define(table)
+        return table
+
     def _make_column(self, field: Field, primarykey):
         ftype = field.type
         nullable = not field.notnull
+        is_pk = bool(primarykey and field.name in primarykey)
         if ftype == "id":
             return sa.Column(field.name, sa.Integer, primary_key=True, autoincrement=True)
         if _t.is_reference(ftype):
             target, tfield = _t.reference_target(ftype)
-            fk = sa.ForeignKey("%s.%s" % (target, tfield or "id"),
-                               ondelete=field.ondelete)
-            return sa.Column(field.name, _t.sa_type_for(ftype), fk,
-                             nullable=nullable, unique=field.unique)
-        is_pk = bool(primarykey and field.name in primarykey)
+            tcol = tfield or self._pk_colname_of(target)
+            fk = sa.ForeignKey("%s.%s" % (target, tcol), ondelete=field.ondelete)
+            # a reference column may itself be part of a composite primary key
+            return sa.Column(field.name, self._reference_sa_type(ftype, target, tfield),
+                             fk, primary_key=is_pk, nullable=nullable, unique=field.unique)
         return sa.Column(field.name, _t.sa_type_for(ftype, field.length),
                          primary_key=is_pk, nullable=nullable, unique=field.unique)
+
+    def _pk_colname_of(self, target):
+        """Default FK target column: the target table's single primary-key
+        column name (falls back to ``id`` for undefined/forward references)."""
+        t = self._tables.get(target)
+        if t is not None and len(t._pk_fields) == 1:
+            return t._pk_fields[0].name
+        return "id"
+
+    def _reference_sa_type(self, ftype, target, tfield):
+        """SA type for a reference column: match the target primary-key column's
+        type (so a reference to a natural/string key isn't forced to Integer);
+        default to the integer/bigint reference type otherwise."""
+        t = self._tables.get(target)
+        if t is not None:
+            col = tfield or (t._pk_fields[0].name if len(t._pk_fields) == 1 else None)
+            if col is not None and col in t._fields:
+                tf = t._fields[col]
+                if tf.type != "id" and not _t.is_reference(tf.type):
+                    return _t.sa_type_for(tf.type, tf.length)
+        return _t.sa_type_for(ftype)
 
     # pydal-compat attributes some validators/tools read
     @property
@@ -192,7 +258,7 @@ class DAL:
     # ---- query entry point -------------------------------------------------
     def __call__(self, query=None, ignore_common_filters=False):
         if isinstance(query, Table):
-            query = query._id != None  # noqa: E711  -> all rows
+            query = query._all_rows_query()  # all rows
         elif isinstance(query, Field):
             query = query != None  # noqa: E711
         return Set(self, query, ignore_common_filters)
@@ -359,7 +425,15 @@ class DAL:
         # belongs(subset): SELECT <field|pk> FROM ... WHERE ...
         where = self._effective_query(s)
         tables = list(_ordered_tables(where._tables)) if where is not None else []
-        col = field.sa if field is not None else tables[0]._id.sa
+        if field is not None:
+            col = field.sa
+        else:
+            pk = tables[0]._pk_fields if tables else []
+            if len(pk) != 1:
+                raise ValueError(
+                    "belongs() on a subquery needs an explicit field for a "
+                    "composite/no-primary-key table")
+            col = pk[0].sa
         stmt = sa.select(col)
         if where is not None:
             stmt = stmt.where(where.sa)
@@ -437,6 +511,21 @@ class DAL:
                 out[name] = field.compute(Row(out))
         return out
 
+    def _pk_return(self, table, values, inserted_primary_key):
+        """Shape the value returned by insert() per the table's primary key:
+        scalar for a single (surrogate or natural) key, dict for a composite
+        key, None for a no-primary-key table."""
+        pk = table._pk_fields
+        if not pk:
+            return None
+        ipk = inserted_primary_key
+        if len(pk) == 1:
+            name = pk[0].name
+            return ipk[0] if ipk else values.get(name)
+        names = [f.name for f in pk]
+        return {n: (ipk[i] if ipk and i < len(ipk) else values.get(n))
+                for i, n in enumerate(names)}
+
     def _insert(self, table: Table, values: dict):
         values = self._apply_defaults(table, values)
         for hook in table._before_insert:
@@ -444,7 +533,7 @@ class DAL:
                 return None
         stmt = sa.insert(table._sa_table).values(**self._filter_columns(table, values))
         result = self._connection.execute(stmt)
-        new_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
+        new_id = self._pk_return(table, values, result.inserted_primary_key)
         for hook in table._after_insert:
             hook(values, new_id)
         return new_id
@@ -497,7 +586,7 @@ class DAL:
             existing = self(query).select().first()
             if existing:
                 self(query).update(**values)
-                return existing[table._id.name]
+                return table._pk_of(existing)
         return table.insert(**values)
 
     def _update(self, s: Set, values: dict, run_hooks=True):
